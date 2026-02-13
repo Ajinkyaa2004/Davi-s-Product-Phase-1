@@ -1,0 +1,11 @@
+----------------------------------------
+Starting ETL at Fri Feb 13 10:37:57 IST 2026
+/Users/ajinkya/Desktop/Davi Product/football_data_fetcher.py:213: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  current_time = datetime.datetime.utcnow().isoformat()
+✅ Historical data is up to date.
+⏳ Fetching upcoming matches for Premier League (England)...
+Found 17 upcoming fixtures.
+Fetching latest odds from The Odds API...
+✅ Successfully updated 17 upcoming fixtures.
+Finished ETL at Fri Feb 13 10:37:59 IST 2026
+----------------------------------------

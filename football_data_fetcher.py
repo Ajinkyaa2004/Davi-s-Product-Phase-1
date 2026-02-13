@@ -140,20 +140,24 @@ def fetch_odds_for_fixture(home_team, away_team, fixture_date_str, odds_key, boo
     # For optimization in main loop we act differently, but keeping compatible signature
     pass 
 
-def fetch_historical_odds(sport_key, date_str, favored_bookmaker):
+def fetch_historical_odds(sport_key, timestamp_str, favored_bookmaker):
     """
-    Fetch historical odds for a specific date.
+    Fetch historical odds for a specific timestamp (ISO).
     Returns list of odds objects with timestamps.
     """
-    iso_date = f"{date_str}T12:00:00Z" # Snapshot time (noon UTC)
+    # Use the provided timestamp directly (e.g., kickoff time for closing odds)
+    # Ensure Z format for API compatibility
+    if timestamp_str.endswith('+00:00'):
+        timestamp_str = timestamp_str.replace('+00:00', 'Z')
+        
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds-history"
-    params = {'apiKey': ODDS_API_KEY, 'regions': 'uk', 'markets': 'h2h', 'date': iso_date}
+    params = {'apiKey': ODDS_API_KEY, 'regions': 'uk', 'markets': 'h2h', 'date': timestamp_str}
     
     data = api_get(url, params=params)
     if not data or 'data' not in data: return []
     
     extracted_odds = []
-    timestamp = data.get('timestamp') # When this snapshot was taken
+    snapshot_time = data.get('timestamp') # When this snapshot was taken
     
     for event in data['data']:
         if not event.get('bookmakers'): continue
@@ -171,7 +175,7 @@ def fetch_historical_odds(sport_key, date_str, favored_bookmaker):
                 'homeTeam': event['home_team'], 'awayTeam': event['away_team'],
                 'homeOdds': h_price, 'drawOdds': d_price, 'awayOdds': a_price,
                 'bookmaker': bookmaker['title'],
-                'timestamp': timestamp # When these odds were valid
+                'timestamp': snapshot_time # When these odds were valid
             })
     return extracted_odds
 
@@ -285,7 +289,7 @@ def etl_historical_matches(manual_start=None, manual_end=None, manual_season=Non
             start_date = last_date + timedelta(days=1)
         else:
             # Fallback if DB is empty
-            start_date = datetime.date(2025, 8, 1) # Start of season roughly
+            start_date = datetime.date(2024, 8, 1) # Start of season roughly
             
         end_date = yesterday
         
@@ -310,15 +314,19 @@ def etl_historical_matches(manual_start=None, manual_end=None, manual_season=Non
     fixtures = data['response']
     print(f"Found {len(fixtures)} matches to process.")
     
-    # 3. Fetch Odds (Day by Day)
-    unique_dates = sorted(list(set(f['fixture']['date'].split('T')[0] for f in fixtures)))
+    # 3. Fetch Odds (Grouped by Kickoff Time for Closing Odds)
+    # We group by specific kickoff time to get the odds as close to kickoff as possible (Closing Odds)
+    unique_kickoff_times = sorted(list(set(f['fixture']['date'] for f in fixtures)))
     odds_map = {}
     
-    for d in unique_dates:
-        print(f"   Fetching odds history for {d}...")
-        daily_odds = fetch_historical_odds(lg_config['oddsKey'], d, get_config_bookmaker_key())
-        for o in daily_odds:
-            key = f"{d}|{normalize_team_name(o['homeTeam'])}|{normalize_team_name(o['awayTeam'])}"
+    print(f"   Fetching closing odds for {len(unique_kickoff_times)} unique kickoff slots...")
+    
+    for kt in unique_kickoff_times:
+        # Pass the FULL ISO timestamp to get odds at that moment
+        kickoff_odds = fetch_historical_odds(lg_config['oddsKey'], kt, get_config_bookmaker_key())
+        for o in kickoff_odds:
+            # Key now includes specific time to match correctly
+            key = f"{kt}|{normalize_team_name(o['homeTeam'])}|{normalize_team_name(o['awayTeam'])}"
             odds_map[key] = o
         time.sleep(0.6) # Rate limiting
         
@@ -337,8 +345,8 @@ def etl_historical_matches(manual_start=None, manual_end=None, manual_season=Non
         result = 'Home' if h_goals > a_goals else ('Away' if a_goals > h_goals else 'Draw')
         date_str = kickoff_time.split('T')[0]
         
-        # Match Odds
-        lookup_key = f"{date_str}|{normalize_team_name(home)}|{normalize_team_name(away)}"
+        # Match Odds - strictly by kickoff time key
+        lookup_key = f"{kickoff_time}|{normalize_team_name(home)}|{normalize_team_name(away)}"
         match_odds = odds_map.get(lookup_key)
         
         # Fuzzy fallback
@@ -348,30 +356,51 @@ def etl_historical_matches(manual_start=None, manual_end=None, manual_season=Non
                     match_odds = v
                     break
         
-        h_odd = match_odds['homeOdds'] if match_odds and match_odds['homeOdds'] != 'N/A' else None
-        d_odd = match_odds['drawOdds'] if match_odds and match_odds['drawOdds'] != 'N/A' else None
-        a_odd = match_odds['awayOdds'] if match_odds and match_odds['awayOdds'] != 'N/A' else None
+        # Extract Closing Odds
+        cl_h_odd = match_odds['homeOdds'] if match_odds and match_odds['homeOdds'] != 'N/A' else None
+        cl_d_odd = match_odds['drawOdds'] if match_odds and match_odds['drawOdds'] != 'N/A' else None
+        cl_a_odd = match_odds['awayOdds'] if match_odds and match_odds['awayOdds'] != 'N/A' else None
+        
+        # For 'home_odds' (generic), we use the closing odds as well
+        h_odd = cl_h_odd
+        d_odd = cl_d_odd
+        a_odd = cl_a_odd
+        
         bk = match_odds['bookmaker'] if match_odds else None
         captured_at = match_odds['timestamp'] if match_odds and 'timestamp' in match_odds else None
 
         records.append((
             fixture_id, date_str, kickoff_time, lg_config['name'], 
             home, away, h_goals, a_goals, result,
-            h_odd, d_odd, a_odd, bk, captured_at
+            h_odd, d_odd, a_odd, bk, captured_at,
+            cl_h_odd, cl_d_odd, cl_a_odd
         ))
         
     # 5. Insert into DB (Upsert on fixture_id)
     try:
+        # Added closing_odds columns
         insert_query = """
-            INSERT INTO historical_matches (fixture_id, date, kickoff_time, league, home_team, away_team, home_goals, away_goals, result, home_odds, draw_odds, away_odds, bookmaker, odds_captured_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO historical_matches (
+                fixture_id, date, kickoff_time, league, home_team, away_team, 
+                home_goals, away_goals, result, 
+                home_odds, draw_odds, away_odds, bookmaker, odds_captured_at,
+                closing_odds_home, closing_odds_draw, closing_odds_away
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (fixture_id) DO UPDATE 
-            SET home_odds = EXCLUDED.home_odds, draw_odds = EXCLUDED.draw_odds, away_odds = EXCLUDED.away_odds, 
-                bookmaker = EXCLUDED.bookmaker, odds_captured_at = EXCLUDED.odds_captured_at, kickoff_time = EXCLUDED.kickoff_time
+            SET home_odds = EXCLUDED.home_odds, 
+                draw_odds = EXCLUDED.draw_odds, 
+                away_odds = EXCLUDED.away_odds, 
+                bookmaker = EXCLUDED.bookmaker, 
+                odds_captured_at = EXCLUDED.odds_captured_at, 
+                kickoff_time = EXCLUDED.kickoff_time,
+                closing_odds_home = EXCLUDED.closing_odds_home,
+                closing_odds_draw = EXCLUDED.closing_odds_draw,
+                closing_odds_away = EXCLUDED.closing_odds_away
         """
         cur.executemany(insert_query, records)
         conn.commit()
-        print(f"✅ Successfully inserted {len(records)} new historical matches.")
+        print(f"✅ Successfully inserted {len(records)} new historical matches with closing odds.")
     except Exception as e:
         conn.rollback()
         print(f"❌ Error inserting historical matches: {e}")
